@@ -18,6 +18,7 @@ finishing its network load.
 """
 import os
 import sys
+import threading
 import time
 import traceback
 
@@ -41,6 +42,29 @@ LOADING_HTML = """<!DOCTYPE html>
   @keyframes spin{to{transform:rotate(360deg)}}
 </style></head>
 <body><div class="wrap"><div class="spinner"></div>Загрузка Discord…</div></body></html>"""
+
+# Same as LOADING_HTML but with an extra note, shown only the very first time
+# the app runs (or right after a reinstall, since that wipes the WebView2
+# cache folder). On a fresh cache Discord's page has nothing local to load
+# from and has to fetch its whole JS/CSS bundle over the network, so this
+# first load is genuinely much slower than every later one -- the extra line
+# just sets that expectation instead of the window going blank with no
+# explanation.
+LOADING_HTML_FIRST_RUN = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  html,body{height:100%;margin:0;background:#1e1f22;
+    display:flex;align-items:center;justify-content:center;
+    font-family:Segoe UI,Arial,sans-serif;color:#949ba4;text-align:center}
+  .wrap{text-align:center}
+  .spinner{width:36px;height:36px;margin:0 auto 14px;
+    border:3px solid #3f4147;border-top-color:#5865f2;border-radius:50%;
+    animation:spin 0.8s linear infinite}
+  .hint{font-size:12px;margin-top:8px;color:#6d7076}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style></head>
+<body><div class="wrap"><div class="spinner"></div>Загрузка Discord…
+<div class="hint">Первый запуск после установки — это может занять чуть больше времени</div>
+</div></body></html>"""
 
 WEBVIEW2_DOWNLOAD_URL = (
     "https://developer.microsoft.com/microsoft-edge/webview2/"
@@ -88,20 +112,56 @@ def _apply_webview2_settings():
     # cache stay on disk between runs instead of being re-downloaded.
     local_app_data = os.environ.get("LOCALAPPDATA") or _base_dir()
     user_data_dir = os.path.join(local_app_data, "Discord_v2", "WebView2")
+    first_run = not os.path.isdir(user_data_dir)
     try:
         os.makedirs(user_data_dir, exist_ok=True)
         os.environ.setdefault("WEBVIEW2_USER_DATA_FOLDER", user_data_dir)
-        log(f"WebView2 profile: {user_data_dir}")
+        log(f"WebView2 profile: {user_data_dir} (first run: {first_run})")
     except Exception:
         log("Could not create WebView2 user data folder, using default")
     # Bump the disk cache size so Discord's (large) JS/CSS bundles and
     # fonts don't get evicted between runs -- eviction would show up as
     # "still slow every time" even though a persistent profile is set.
     os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--disk-cache-size=314572800")
-    # NOTE: earlier builds disabled GPU rendering (--disable-gpu ...) as a
-    # blank-screen workaround. That turned out not to be the cause (it was
-    # just slow script loading over the network) and forcing software
-    # rendering only makes Discord's heavy UI slower, so it's removed now.
+    return first_run
+
+
+def _apply_native_window_icon():
+    """Force the taskbar/title-bar icon to the one built into the .exe.
+
+    PyInstaller bakes icon.ico into Discord.exe as a Win32 resource (via
+    --icon), but pywebview's window doesn't reliably pick that up -- it can
+    keep showing a generic placeholder icon in the taskbar even though the
+    .exe file itself has the right icon in Explorer. Pulling the icon back
+    out of the running .exe and pushing it onto the window with the
+    standard WM_SETICON message fixes this without depending on any
+    pywebview internals (just the window's title, which we control).
+    """
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.user32.FindWindowW(None, WINDOW_TITLE)
+        if not hwnd:
+            log("Could not find native window handle to set its icon")
+            return
+
+        large = ctypes.c_void_p()
+        small = ctypes.c_void_p()
+        ctypes.windll.shell32.ExtractIconExW(
+            sys.executable, 0, ctypes.byref(large), ctypes.byref(small), 1
+        )
+
+        WM_SETICON = 0x0080
+        ICON_BIG, ICON_SMALL = 1, 0
+        if large.value:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, large.value)
+        if small.value:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small.value)
+        log("Applied .exe icon to the native window/taskbar")
+    except Exception:
+        log("Could not set native window icon:\n" + traceback.format_exc())
 
 
 def main():
@@ -110,7 +170,7 @@ def main():
     except Exception:
         pass
     log("--- Diskord starting ---")
-    _apply_webview2_settings()
+    first_run = _apply_webview2_settings()
 
     log("Importing webview module...")
     import webview  # imported after env vars are set on purpose
@@ -126,7 +186,7 @@ def main():
     # it -- never a blank/white frame.
     window = webview.create_window(
         WINDOW_TITLE,
-        html=LOADING_HTML,
+        html=LOADING_HTML_FIRST_RUN if first_run else LOADING_HTML,
         width=1280,
         height=820,
         min_size=(480, 360),
@@ -136,6 +196,13 @@ def main():
     )
 
     state = {"revealed": False}
+
+    def navigate_to_discord():
+        log("Navigating to " + DISCORD_URL)
+        try:
+            window.load_url(DISCORD_URL)
+        except Exception:
+            log("load_url FAILED:\n" + traceback.format_exc())
 
     def on_loaded():
         # Fires once for the local loading screen, once for Discord's
@@ -149,12 +216,21 @@ def main():
 
         if not state["revealed"]:
             state["revealed"] = True
-            log("Loading screen painted -> revealing window, navigating to " + DISCORD_URL)
+            log("Loading screen painted -> revealing window")
             window.show()
-            try:
-                window.load_url(DISCORD_URL)
-            except Exception:
-                log("load_url FAILED:\n" + traceback.format_exc())
+            _apply_native_window_icon()
+
+            if first_run:
+                # Once we navigate, Discord's own (still-loading, blank)
+                # page replaces our spinner -- normal browser behaviour for
+                # any full-page navigation, not something we can prevent.
+                # On a fresh cache that load can take a while, so give the
+                # user a moment to actually read the "first run" hint above
+                # before the window goes blank while Discord loads for real.
+                log("First run -> keeping the loading screen up briefly before navigating")
+                threading.Timer(1.5, navigate_to_discord).start()
+            else:
+                navigate_to_discord()
 
     window.events.loaded += on_loaded
 

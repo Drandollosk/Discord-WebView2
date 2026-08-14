@@ -42,19 +42,13 @@ set "APP_EXE=%APP_DIR%\Discord.exe"
 
 echo.
 echo Building Discord.exe into %APP_DIR% ...
-rem --onedir (the default, no --onefile) instead of a single-file exe:
-rem a --onefile build has to silently self-extract its whole Python
-rem runtime to a temp folder on *every* launch, which is exactly the
-rem multi-second startup delay before WebView2 even gets a chance to run.
-rem --onedir launches straight from already-unpacked files -- much faster.
-rem --distpath = final app folder goes straight into AppData\Local\Discord_v2.
-rem --workpath / --specpath = all intermediate build junk goes into a temp
-rem folder instead of cluttering this project folder.
-rem Absolute paths everywhere: with --specpath set, PyInstaller resolves
-rem relative paths (like a relative --icon) against the temp spec folder,
-rem not against this project folder -- so a relative "icons\icon.ico"
-rem fails with FileNotFoundError once it's not run from here directly.
-python -m PyInstaller --windowed --noconfirm --name Discord --icon "%~dp0icons\icon.ico" --distpath "%INSTALL_DIR%" --workpath "%WORK_DIR%" --specpath "%WORK_DIR%" "%~dp0discord_app.py"
+rem --onedir (no --onefile): launches straight from unpacked files instead
+rem of self-extracting the whole Python runtime on every start.
+rem --distpath puts the app straight into AppData\Local\Discord_v2;
+rem --workpath/--specpath keep build junk out of this project folder.
+rem Paths passed as absolute (%~dp0...): with --specpath set, PyInstaller
+rem resolves relative paths against the temp spec folder, not this one.
+python -m PyInstaller --windowed --noconfirm --name Discord --icon "%~dp0icon.ico" --distpath "%INSTALL_DIR%" --workpath "%WORK_DIR%" --specpath "%WORK_DIR%" "%~dp0discord_app.py"
 if errorlevel 1 (
     echo.
     echo Build failed. See the output above.
