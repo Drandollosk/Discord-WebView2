@@ -109,7 +109,9 @@ def _apply_webview2_settings():
     # Persistent, guaranteed-writable user data folder (instead of a fresh
     # temp profile each run). This is what makes the *second* launch faster
     # than the first: Discord's JS/CSS bundles, fonts and service-worker
-    # cache stay on disk between runs instead of being re-downloaded.
+    # cache stay on disk between runs instead of being re-downloaded. It's
+    # also where the login session (cookies) needs to live for Discord to
+    # stay logged in between runs -- see private_mode/storage_path below.
     local_app_data = os.environ.get("LOCALAPPDATA") or _base_dir()
     user_data_dir = os.path.join(local_app_data, "Discord_v2", "WebView2")
     first_run = not os.path.isdir(user_data_dir)
@@ -243,7 +245,24 @@ def main():
 
     log("Calling webview.start()...")
     try:
-        webview.start(gui=gui)
+        # private_mode=False is the fix for "Discord asks me to log in every
+        # time": pywebview defaults to private_mode=True (like an incognito
+        # window), which throws away cookies/local storage -- i.e. the login
+        # session -- after every run, regardless of any WebView2 env var.
+        #
+        # Deliberately NOT also passing storage_path=user_data_dir here: an
+        # earlier version did, and the very next first-run-after-reinstall
+        # (fresh, empty profile folder) got stuck on a permanently blank
+        # white page -- WebView2 finished "loading" (our own log confirms
+        # the page fired its load event) but never actually painted
+        # anything, and it never recovered on its own. That combination
+        # (private_mode=False + an explicit, brand new storage_path) is the
+        # one prior working configurations didn't have, so it's the prime
+        # suspect. WEBVIEW2_USER_DATA_FOLDER (set above) already points
+        # WebView2 at the same persistent folder at a lower level, so
+        # private_mode=False alone should be enough to keep the login
+        # session without going through pywebview's own storage_path path.
+        webview.start(gui=gui, private_mode=False)
         log("webview.start returned normally (window closed)")
     except Exception as exc:
         log("webview.start FAILED:\n" + traceback.format_exc())
