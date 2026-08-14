@@ -1,3 +1,4 @@
+winget install Python.Python.3.13
 @echo off
 setlocal enabledelayedexpansion
 title Diskord Setup
