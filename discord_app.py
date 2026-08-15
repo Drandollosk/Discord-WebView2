@@ -18,7 +18,6 @@ finishing its network load.
 """
 import os
 import sys
-import threading
 import time
 import traceback
 
@@ -26,6 +25,8 @@ _T0 = time.perf_counter()
 
 DISCORD_URL = "https://discord.com/app"
 WINDOW_TITLE = "Discord"
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 820
 
 # Shown instantly while WebView2 spins up and Discord's page is still
 # fetching (roughly the first ~1-2 seconds) so the window never looks
@@ -111,21 +112,39 @@ def _apply_webview2_settings():
     # than the first: Discord's JS/CSS bundles, fonts and service-worker
     # cache stay on disk between runs instead of being re-downloaded. It's
     # also where the login session (cookies) needs to live for Discord to
-    # stay logged in between runs -- see private_mode/storage_path below.
+    # stay logged in between runs.
+    #
+    # NOTE: pywebview's edgechromium/winforms backend does NOT read the
+    # WEBVIEW2_USER_DATA_FOLDER env var -- it always sets the WebView2
+    # CoreWebView2EnvironmentOptions.UserDataFolder itself from its own
+    # internal cache_dir, which defaults to %APPDATA%\pywebview unless we
+    # pass storage_path=... to webview.start() (see main()). So this
+    # function only computes the path and reports whether it's a first
+    # run -- the actual wiring to WebView2 happens via storage_path.
     local_app_data = os.environ.get("LOCALAPPDATA") or _base_dir()
     user_data_dir = os.path.join(local_app_data, "Discord_v2", "WebView2")
     first_run = not os.path.isdir(user_data_dir)
     try:
         os.makedirs(user_data_dir, exist_ok=True)
-        os.environ.setdefault("WEBVIEW2_USER_DATA_FOLDER", user_data_dir)
         log(f"WebView2 profile: {user_data_dir} (first run: {first_run})")
     except Exception:
         log("Could not create WebView2 user data folder, using default")
     # Bump the disk cache size so Discord's (large) JS/CSS bundles and
     # fonts don't get evicted between runs -- eviction would show up as
     # "still slow every time" even though a persistent profile is set.
-    os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--disk-cache-size=314572800")
-    return first_run
+    #
+    # --use-fake-ui-for-media-stream auto-accepts the "discord.com wants to
+    # use your microphone" browser permission prompt instead of showing it
+    # -- this only skips the popup, it does NOT fake the actual audio: the
+    # real microphone is still used for voice calls. (Do not confuse this
+    # with --use-fake-device-for-media-stream, a different flag that
+    # replaces the real mic/camera with a synthetic test tone/pattern --
+    # that one would break real voice chat, so it's deliberately not used.)
+    os.environ.setdefault(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--disk-cache-size=314572800 --use-fake-ui-for-media-stream",
+    )
+    return first_run, user_data_dir
 
 
 def _apply_native_window_icon():
@@ -172,7 +191,7 @@ def main():
     except Exception:
         pass
     log("--- Diskord starting ---")
-    first_run = _apply_webview2_settings()
+    first_run, user_data_dir = _apply_webview2_settings()
 
     log("Importing webview module...")
     import webview  # imported after env vars are set on purpose
@@ -189,8 +208,8 @@ def main():
     window = webview.create_window(
         WINDOW_TITLE,
         html=LOADING_HTML_FIRST_RUN if first_run else LOADING_HTML,
-        width=1280,
-        height=820,
+        width=WINDOW_WIDTH,
+        height=WINDOW_HEIGHT,
         min_size=(480, 360),
         text_select=True,
         confirm_close=False,
@@ -200,6 +219,8 @@ def main():
     state = {"revealed": False}
 
     def navigate_to_discord():
+        # Must run synchronously on the same (native UI/COM) thread that
+        # fired the 'loaded' event -- see the on_loaded() note below for why.
         log("Navigating to " + DISCORD_URL)
         try:
             window.load_url(DISCORD_URL)
@@ -222,17 +243,41 @@ def main():
             window.show()
             _apply_native_window_icon()
 
-            if first_run:
-                # Once we navigate, Discord's own (still-loading, blank)
-                # page replaces our spinner -- normal browser behaviour for
-                # any full-page navigation, not something we can prevent.
-                # On a fresh cache that load can take a while, so give the
-                # user a moment to actually read the "first run" hint above
-                # before the window goes blank while Discord loads for real.
-                log("First run -> keeping the loading screen up briefly before navigating")
-                threading.Timer(1.5, navigate_to_discord).start()
-            else:
-                navigate_to_discord()
+            # IMPORTANT: call navigate_to_discord() directly, right here,
+            # inline in this event callback -- do NOT defer it via
+            # threading.Timer (or any other background thread). Earlier
+            # versions delayed the *first* navigation this way (to let the
+            # "first run" loading screen stay up a bit longer), and that is
+            # the prime suspect for the permanent-blank-page bug: WebView2
+            # is a native WinForms/COM control, and calling window.load_url()
+            # from a background Python thread instead of the thread that
+            # owns the control is an unsupported cross-thread COM call. It
+            # doesn't throw -- it can even still report 'loaded' -- but the
+            # page never actually paints, and nothing recovers it afterwards.
+            # Every navigation this app makes must happen on this same
+            # callback thread, which is why this is called directly instead
+            # of scheduled.
+            navigate_to_discord()
+        else:
+            # This fires after the REAL navigation (to Discord itself, or
+            # any later in-app navigation Discord triggers, e.g. after
+            # login) finishes loading. Even with the synchronous navigation
+            # above, this has still been reproduced on a brand new WebView2
+            # profile folder: the page reports 'loaded' right here, but the
+            # control never actually paints anything -- the window just
+            # stays blank/white forever, even though every signal says the
+            # navigation succeeded. This matches a known class of
+            # WebView2/Chromium-embedding bug where the compositor gets
+            # stuck and won't paint until something forces a layout
+            # recompute -- an actual resize does that reliably. Nudging the
+            # window by 1px and immediately back isn't visible to the user
+            # (well under a single visible frame) but forces that recompute.
+            try:
+                window.resize(WINDOW_WIDTH + 1, WINDOW_HEIGHT)
+                window.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
+                log("Nudged window size to force a repaint")
+            except Exception:
+                log("Resize nudge FAILED:\n" + traceback.format_exc())
 
     window.events.loaded += on_loaded
 
@@ -248,21 +293,19 @@ def main():
         # private_mode=False is the fix for "Discord asks me to log in every
         # time": pywebview defaults to private_mode=True (like an incognito
         # window), which throws away cookies/local storage -- i.e. the login
-        # session -- after every run, regardless of any WebView2 env var.
+        # session -- after every run.
         #
-        # Deliberately NOT also passing storage_path=user_data_dir here: an
-        # earlier version did, and the very next first-run-after-reinstall
-        # (fresh, empty profile folder) got stuck on a permanently blank
-        # white page -- WebView2 finished "loading" (our own log confirms
-        # the page fired its load event) but never actually painted
-        # anything, and it never recovered on its own. That combination
-        # (private_mode=False + an explicit, brand new storage_path) is the
-        # one prior working configurations didn't have, so it's the prime
-        # suspect. WEBVIEW2_USER_DATA_FOLDER (set above) already points
-        # WebView2 at the same persistent folder at a lower level, so
-        # private_mode=False alone should be enough to keep the login
-        # session without going through pywebview's own storage_path path.
-        webview.start(gui=gui, private_mode=False)
+        # storage_path=user_data_dir is what actually points WebView2 at our
+        # own persistent folder (AppData\Local\Discord_v2\WebView2). This
+        # was removed in an earlier version because it was mistakenly
+        # blamed for the permanent-blank-page bug -- but pywebview's own
+        # source shows the real cause was elsewhere: without storage_path,
+        # pywebview silently falls back to its own default profile folder
+        # (%APPDATA%\pywebview), completely disconnected from the folder
+        # this app tracks/cleans up. The actual blank-page bug was the
+        # background-thread navigation call fixed above in on_loaded(), so
+        # storage_path is safe to use again.
+        webview.start(gui=gui, private_mode=False, storage_path=user_data_dir)
         log("webview.start returned normally (window closed)")
     except Exception as exc:
         log("webview.start FAILED:\n" + traceback.format_exc())

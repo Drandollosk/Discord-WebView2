@@ -1,53 +1,18 @@
-winget install Python.Python.3.13
 @echo off
 setlocal enabledelayedexpansion
 title Diskord Setup
+rem Widen the console -- a narrow default window wraps long lines (error
+rem messages especially), which has made a few error reports look cut off.
+mode con: cols=110 lines=40 >nul 2>nul
 cd /d "%~dp0"
 
-rem If discord_app.py isn't sitting next to this script, it's probably
-rem running standalone next to a still-zipped GitHub download (e.g. someone
-rem saved just this .bat plus the project zip into the same folder, instead
-rem of extracting the whole zip first). Auto-unpack that zip so people don't
-rem have to extract it by hand before they can run this.
 if not exist "discord_app.py" (
-    echo Project files not found next to this script -- looking for a zip to unpack...
-    set "SRC_ZIP="
-    for %%f in ("%~dp0*.zip") do if not defined SRC_ZIP set "SRC_ZIP=%%~ff"
-    if not defined SRC_ZIP (
-        echo Could not find discord_app.py or a project .zip next to this script.
-        echo Put the project's .zip ^(downloaded from GitHub^) in the same
-        echo folder as this .bat file and run it again.
-        pause
-        exit /b 1
-    )
-    echo Found: !SRC_ZIP!
-    set "UNZIP_DIR=%TEMP%\diskord_unzip"
-    if exist "!UNZIP_DIR!" rmdir /s /q "!UNZIP_DIR!" >nul 2>nul
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '!SRC_ZIP!' -DestinationPath '!UNZIP_DIR!' -Force"
-    if errorlevel 1 (
-        echo.
-        echo Failed to unpack the zip. See the output above.
-        pause
-        exit /b 1
-    )
-    rem A GitHub zip contains one top-level folder (e.g. Discord-WebView2-main\)
-    rem -- copy its contents up next to this script so everything below,
-    rem which expects discord_app.py etc. right here, keeps working unchanged.
-    rem Excludes this .bat's own filename: cmd.exe reads a running batch file
-    rem by byte offset as it goes, so overwriting it mid-run can corrupt the
-    rem rest of this very script.
-    set "XCOPY_EXCLUDE=%TEMP%\diskord_xcopy_exclude.txt"
-    > "!XCOPY_EXCLUDE!" echo %~nx0
-    for /d %%d in ("!UNZIP_DIR!\*") do xcopy "%%d\*" "%~dp0" /e /i /y /exclude:"!XCOPY_EXCLUDE!" >nul
-    del "!XCOPY_EXCLUDE!" >nul 2>nul
-    rmdir /s /q "!UNZIP_DIR!" >nul 2>nul
-    if not exist "discord_app.py" (
-        echo Unpacking the zip did not produce discord_app.py -- aborting.
-        pause
-        exit /b 1
-    )
-    echo Unpacked project files next to this script.
-    echo.
+    echo discord_app.py not found next to this script. Make sure this .bat
+    echo is sitting in the same folder as the rest of the project files
+    echo ^(if you downloaded a .zip from GitHub, extract it first^) and run
+    echo it again.
+    pause
+    exit /b 1
 )
 
 set "INSTALL_DIR=%LOCALAPPDATA%\Discord_v2"
@@ -57,22 +22,153 @@ echo === Diskord: setup ===
 echo Install folder: %INSTALL_DIR%
 echo.
 
-where python >nul 2>nul
-if errorlevel 1 (
-    echo Python not found. Install it from https://python.org
-    echo ^(check "Add python.exe to PATH"^) and run this file again.
-    pause
-    exit /b 1
+rem Pinned to 3.12, not "latest": pythonnet (needed for the WebView2 backend)
+rem crashes on 3.13/3.14 as of this writing, so grabbing whatever's newest
+rem would silently break a brand new install. 3.12.12 is the newest 3.12.x
+rem patch release at the time this was written -- bump it here if a newer
+rem 3.12.x patch comes out, but don't jump to 3.13+ until pythonnet supports it.
+set "PY_VER=3.12.12"
+
+echo Checking for Python...
+rem Plain "where python" isn't enough: on a clean Windows 10/11 machine
+rem with no real Python installed, PATH still contains a fake python.exe
+rem "app execution alias" stub under ...\Microsoft\WindowsApps\ (Windows
+rem puts it there so typing "python" in a fresh terminal offers to install
+rem it from the Microsoft Store). "where python" happily finds that stub
+rem and reports success -- but actually running it can pop up the Store app
+rem and just sit there waiting, which is exactly the freeze right after
+rem "Checking installed dependencies...". So: look at every match "where"
+rem finds and only count it as a real Python if its path is NOT that stub.
+set "PYEXE="
+for /f "delims=" %%i in ('where python 2^>nul') do (
+    echo %%i| findstr /i "WindowsApps" >nul
+    if errorlevel 1 (
+        if not defined PYEXE set "PYEXE=%%i"
+    )
+)
+if not defined PYEXE (
+    echo Python not found -- installing it automatically ^(this is a one-time
+    echo step, ~1-2 minutes^)...
+    echo.
+    set "PY_READY="
+
+    rem Prefer winget when available: it's already on most Windows 10/11
+    rem machines, handles the download itself, and Python.Python.3.12 pins
+    rem the same 3.12 line as the manual fallback below (not "latest").
+    where winget >nul 2>nul
+    if not errorlevel 1 (
+        echo Trying winget...
+        winget install --id Python.Python.3.12 -e --silent --accept-package-agreements --accept-source-agreements >nul 2>nul
+        if not errorlevel 1 set "PY_READY=1"
+    )
+
+    if not defined PY_READY (
+        echo Downloading the official installer from python.org...
+        set "PY_INSTALLER=%TEMP%\diskord_python_installer.exe"
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/!PY_VER!/python-!PY_VER!-amd64.exe' -OutFile '!PY_INSTALLER!'"
+        if errorlevel 1 (
+            echo.
+            echo Could not download the Python installer -- check your internet
+            echo connection, or install Python manually from https://python.org
+            echo ^(check "Add python.exe to PATH"^) and run this file again.
+            pause
+            exit /b 1
+        )
+        echo Installing Python !PY_VER! quietly ^(no windows will pop up^)...
+        rem InstallAllUsers=0 -- installs just for this user, under
+        rem %LOCALAPPDATA%\Programs\Python, so it doesn't need admin rights.
+        "!PY_INSTALLER!" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=0
+        set "PY_INSTALL_ERR=!errorlevel!"
+        del /q "!PY_INSTALLER!" >nul 2>nul
+        if not "!PY_INSTALL_ERR!"=="0" (
+            echo.
+            echo Python installation failed ^(exit code !PY_INSTALL_ERR!^). Install it
+            echo manually from https://python.org and run this file again.
+            pause
+            exit /b 1
+        )
+        set "PY_READY=1"
+    )
+
+    rem The installer/winget just updated PATH in the registry, but this cmd
+    rem window already started with the old PATH and won't pick that change
+    rem up on its own -- re-read the real, current User+Machine PATH straight
+    rem from the registry (that's what a brand new window would get) and
+    rem overwrite this session's PATH with it. This is more reliable than
+    rem guessing the install folder name: it works no matter where Python
+    rem (or winget) actually put it.
+    for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"`) do set "PATH=%%p"
+
+    rem Belt-and-suspenders fallback in case the registry read above didn't
+    rem catch it for some reason (e.g. PrependPath didn't run yet) -- look
+    rem directly in the two folders Python actually installs into.
+    for /d %%p in ("%LOCALAPPDATA%\Programs\Python\Python3*") do (
+        if exist "%%p\python.exe" set "PATH=%%p;%%p\Scripts;!PATH!"
+    )
+    for /d %%p in ("%ProgramFiles%\Python3*") do (
+        if exist "%%p\python.exe" set "PATH=%%p;%%p\Scripts;!PATH!"
+    )
+
+    set "PYEXE="
+    for /f "delims=" %%i in ('where python 2^>nul') do (
+        echo %%i| findstr /i "WindowsApps" >nul
+        if errorlevel 1 (
+            if not defined PYEXE set "PYEXE=%%i"
+        )
+    )
+    if not defined PYEXE (
+        echo.
+        echo Python was installed, but this window still can't see it. Close
+        echo this window, open "Установить Discord.bat" again ^(a fresh window
+        echo always picks up the updated PATH^), and it'll continue from here
+        echo normally -- Python won't need to be installed again.
+        pause
+        exit /b 1
+    )
+    echo Python installed successfully.
+    echo.
 )
 
-echo Installing dependencies (pywebview, pythonnet, pyinstaller)...
-python -m pip install --upgrade pip >nul
-python -m pip install -r requirements.txt pyinstaller
-if errorlevel 1 (
-    echo.
-    echo Dependency installation failed. See the output above.
-    pause
-    exit /b 1
+rem Installing/upgrading pip + the 3 packages below is the slowest part of
+rem a repeat run (re-launching this .bat after every small code change, or
+rem after Ochistit papku.vbs + reinstall) even though nothing actually
+rem changed. If they're already installed, skip straight to the build --
+rem this is what turns a ~10-30s no-op pip step into effectively 0s on
+rem every run after the first one on a given machine.
+rem
+rem Checked purely on disk (dist-info folders under Python's own
+rem site-packages), NOT by running "python -m pip show" or "python -c
+rem import ...": both of those actually launch python.exe, and on at least
+rem one machine that alone either hung with zero output or crashed with an
+rem OS-level error -- exactly the freeze/error right after "Checking
+rem installed dependencies...". A plain folder check can't hang or crash
+rem like that because it never launches Python at all.
+echo Checking installed dependencies...
+set "DEPS_OK="
+if defined PYEXE (
+    for %%f in ("!PYEXE!") do set "PY_SITE_PKGS=%%~dpfLib\site-packages"
+    set "DEPS_OK=1"
+    dir /b "!PY_SITE_PKGS!\pywebview-*.dist-info" >nul 2>nul
+    if errorlevel 1 set "DEPS_OK="
+    dir /b "!PY_SITE_PKGS!\pythonnet-*.dist-info" >nul 2>nul
+    if errorlevel 1 set "DEPS_OK="
+    dir /b "!PY_SITE_PKGS!\pyinstaller-*.dist-info" >nul 2>nul
+    if errorlevel 1 set "DEPS_OK="
+)
+if not defined DEPS_OK (
+    echo Installing dependencies ^(pywebview, pythonnet, pyinstaller^)...
+    echo ^(this runs python.exe for real, so if THIS hangs or errors, that
+    echo tells us it's Python itself, not this checking step^)
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt pyinstaller
+    if errorlevel 1 (
+        echo.
+        echo Dependency installation failed. See the output above.
+        pause
+        exit /b 1
+    )
+) else (
+    echo Dependencies already installed -- skipping.
 )
 
 rem Old layout cleanup: earlier versions built into ".\dist" inside this
