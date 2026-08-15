@@ -1,4 +1,4 @@
-# Diskord — отдельное приложение для Discord Web
+# Discord — отдельное приложение для Discord Web
 
 Открывает настоящий официальный веб-клиент Discord (`https://discord.com/app`)
 в собственном окне со встроенным WebView (Microsoft Edge WebView2) —
