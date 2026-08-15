@@ -154,9 +154,13 @@ if defined PYEXE (
     if errorlevel 1 set "DEPS_OK="
     dir /b "!PY_SITE_PKGS!\pyinstaller-*.dist-info" >nul 2>nul
     if errorlevel 1 set "DEPS_OK="
+    dir /b "!PY_SITE_PKGS!\pystray-*.dist-info" >nul 2>nul
+    if errorlevel 1 set "DEPS_OK="
+    dir /b "!PY_SITE_PKGS!\pillow-*.dist-info" >nul 2>nul
+    if errorlevel 1 set "DEPS_OK="
 )
 if not defined DEPS_OK (
-    echo Installing dependencies ^(pywebview, pythonnet, pyinstaller^)...
+    echo Installing dependencies ^(pywebview, pythonnet, pystray, Pillow, pyinstaller^)...
     echo ^(this runs python.exe for real, so if THIS hangs or errors, that
     echo tells us it's Python itself, not this checking step^)
     python -m pip install --upgrade pip
@@ -191,7 +195,11 @@ rem --distpath puts the app straight into AppData\Local\Discord_v2;
 rem --workpath/--specpath keep build junk out of this project folder.
 rem Paths passed as absolute (%~dp0...): with --specpath set, PyInstaller
 rem resolves relative paths against the temp spec folder, not this one.
-python -m PyInstaller --windowed --noconfirm --name Discord --icon "%~dp0icon.ico" --distpath "%INSTALL_DIR%" --workpath "%WORK_DIR%" --specpath "%WORK_DIR%" "%~dp0discord_app.py"
+rem --add-data bundles icon.ico as a plain data file too (separate from
+rem --icon, which only embeds it as the .exe's own Win32 resource): the
+rem tray icon needs to open it as an actual image file at runtime, which it
+rem can't do with an icon that only exists baked into the .exe.
+python -m PyInstaller --windowed --noconfirm --name Discord --icon "%~dp0icon.ico" --add-data "%~dp0icon.ico;." --distpath "%INSTALL_DIR%" --workpath "%WORK_DIR%" --specpath "%WORK_DIR%" "%~dp0discord_app.py"
 if errorlevel 1 (
     echo.
     echo Build failed. See the output above.

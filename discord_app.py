@@ -18,6 +18,7 @@ finishing its network load.
 """
 import os
 import sys
+import threading
 import time
 import traceback
 
@@ -78,6 +79,17 @@ def _base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resource_path(name):
+    # Location of bundled data files (like icon.ico) at runtime -- NOT the
+    # same as _base_dir(). When frozen by PyInstaller, data files added via
+    # --add-data are unpacked under sys._MEIPASS, which for this project's
+    # --onedir build resolves to the app's own _internal folder next to
+    # Discord.exe, not the top-level folder _base_dir() points at. Falls
+    # back to _base_dir() when running from source (python discord_app.py).
+    base = getattr(sys, "_MEIPASS", None) or _base_dir()
+    return os.path.join(base, name)
 
 
 LOG_PATH = os.path.join(_base_dir(), "diskord_error.log")
@@ -185,6 +197,62 @@ def _apply_native_window_icon():
         log("Could not set native window icon:\n" + traceback.format_exc())
 
 
+def _run_tray(window, state):
+    """Runs a system tray icon for the lifetime of the app (Diskord's own
+    icon, in the "hidden icons" area), so closing the window with the X
+    button hides it instead of quitting -- the same behaviour as Discord's
+    own desktop client, Slack, etc. Call this in its own daemon thread;
+    pystray's Icon.run() blocks the calling thread until icon.stop() is
+    called from the "Exit" menu item below.
+
+    The click callbacks below only ever call window.show()/hide()/destroy()
+    -- never window.load_url(). That distinction matters here: pywebview's
+    winforms backend marshals show()/hide()/destroy() onto the UI thread
+    internally (they each check/Invoke() under the hood), so calling them
+    from this background thread is safe. load_url() does NOT do that
+    marshaling, which is why it has to run on the same thread as the
+    'loaded' event instead (see the on_loaded() comment above).
+    """
+    try:
+        import pystray
+        from PIL import Image
+    except Exception:
+        log("Tray: pystray/Pillow not available, skipping tray icon:\n" + traceback.format_exc())
+        return
+
+    try:
+        image = Image.open(_resource_path("icon.ico"))
+    except Exception:
+        log("Tray: could not load icon.ico, using a plain fallback square:\n" + traceback.format_exc())
+        image = Image.new("RGB", (64, 64), "#5865f2")
+
+    def on_open(icon_obj, item):
+        log("Tray: 'Open Discord' selected")
+        window.show()
+
+    def on_exit(icon_obj, item):
+        log("Tray: 'Exit' selected -> closing for real")
+        state["quitting"] = True
+        icon_obj.stop()
+        window.destroy()
+
+    tray_icon = pystray.Icon(
+        "Diskord",
+        image,
+        WINDOW_TITLE,
+        menu=pystray.Menu(
+            pystray.MenuItem("Открыть Discord", on_open, default=True),
+            pystray.MenuItem("Выход", on_exit),
+        ),
+    )
+    log("Tray icon starting")
+    try:
+        tray_icon.run()
+    except Exception:
+        log("Tray icon crashed:\n" + traceback.format_exc())
+    log("Tray icon stopped")
+
+
 def main():
     try:
         open(LOG_PATH, "w", encoding="utf-8").close()
@@ -216,7 +284,7 @@ def main():
         hidden=True,
     )
 
-    state = {"revealed": False}
+    state = {"revealed": False, "quitting": False, "tray_started": False}
 
     def navigate_to_discord():
         # Must run synchronously on the same (native UI/COM) thread that
@@ -279,7 +347,38 @@ def main():
             except Exception:
                 log("Resize nudge FAILED:\n" + traceback.format_exc())
 
+            if not state["tray_started"]:
+                state["tray_started"] = True
+                # Deliberately started here -- only after the real Discord
+                # page has actually loaded -- and NOT earlier in main()
+                # before webview.start(). Starting it earlier put pystray's
+                # own background win32 message loop running concurrently
+                # with WebView2's most fragile moment (first-run environment
+                # + GPU/compositor init), and that reintroduced the exact
+                # permanent-blank-page bug the resize nudge above was
+                # already fixing on its own. By this point that fragile
+                # window has passed, so it's safe to start.
+                tray_thread = threading.Thread(target=_run_tray, args=(window, state), daemon=True)
+                tray_thread.start()
+
     window.events.loaded += on_loaded
+
+    def on_closing():
+        # Fires when the user clicks the window's own X button. Hide
+        # instead of actually closing -- the tray icon (started in
+        # on_loaded above) keeps the app running and reachable, matching
+        # how Discord's own desktop client behaves. state["quitting"] is
+        # only set True by the tray's "Exit" item (see _run_tray above),
+        # which is the one case where the close should really go through;
+        # returning False here is what tells pywebview to cancel the close.
+        if state["quitting"]:
+            log("Window closing for real")
+            return
+        log("Close button clicked -> hiding to tray instead of exiting")
+        window.hide()
+        return False
+
+    window.events.closing += on_closing
 
     # 'edgechromium' = Microsoft Edge WebView2 (Chromium engine). Discord's
     # web app needs a modern Chromium engine — the legacy 'mshtml' (Internet
